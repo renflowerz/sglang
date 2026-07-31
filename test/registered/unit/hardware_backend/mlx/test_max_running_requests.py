@@ -21,24 +21,11 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-
-import pytest as _pytest_defer
-
-_DEFER_REASON = (
-    "Temporarily skipped during the ServerArgs config-namespace migration; "
-    "re-enabled once the runtime-config accessor API stabilizes."
-)
-pytestmark = _pytest_defer.mark.skip(reason=_DEFER_REASON)
-
-
-def setUpModule():
-    import unittest
-
-    raise unittest.SkipTest(_DEFER_REASON)
 
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -69,9 +56,20 @@ def _arch(hybrid):
     )
 
 
+def _published(stub):
+    """The resolver reads the published config (get_schedule() /
+    get_memory()), not stub attributes — publish what the stub was built
+    with."""
+    return get_context().override_server_args(
+        max_running_requests=stub._max_running_requests,
+        max_mamba_cache_size=stub._max_mamba_cache_size,
+        disable_radix_cache=stub._disable_radix_cache,
+    )
+
+
 def _resolve(stub, hybrid=False):
     """Run the resolver with the model architecture patched (see _arch)."""
-    with _arch(hybrid):
+    with _arch(hybrid), _published(stub):
         return stub._resolve_max_running_requests()
 
 
@@ -85,13 +83,11 @@ def _stub(
     """A stub carrying only what _resolve_max_running_requests reads."""
     stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
     stub.model_config = SimpleNamespace()  # only handed to the patched _arch fn
-    stub.server_args = SimpleNamespace(
-        max_running_requests=max_running_requests,
-        max_mamba_cache_size=max_mamba_cache_size,
-        disable_radix_cache=disable_radix_cache,
-    )
+    stub._max_running_requests = max_running_requests
+    stub._max_mamba_cache_size = max_mamba_cache_size
+    stub._disable_radix_cache = disable_radix_cache
     stub.max_total_num_tokens = max_total_num_tokens
-    stub.dp_size = dp_size
+    stub.ps = SimpleNamespace(attn_dp_size=dp_size)
     return stub
 
 
@@ -101,14 +97,14 @@ def _hybrid_stub_for_initialize(
     """A stub carrying what the real initialize() reads (hybrid path)."""
     stub = MlxModelRunnerStub.__new__(MlxModelRunnerStub)
     stub._mlx_pool_size = pool
-    stub.dp_size = 1
+    stub.ps = SimpleNamespace(attn_dp_size=1)
     stub.device = "cpu"  # read by init_ngram_embedding_manager
-    stub.server_args = SimpleNamespace(
-        enable_memory_saver=False,
-        max_running_requests=max_running_requests,
-        max_mamba_cache_size=max_mamba_cache_size,
-        disable_radix_cache=disable_radix_cache,
-    )
+    # Whole-object pass into NgramEmbeddingManager.from_model, evaluated
+    # before its use_ngram_embedding short-circuit — must exist, is not read.
+    stub.server_args = SimpleNamespace()
+    stub._max_running_requests = max_running_requests
+    stub._max_mamba_cache_size = max_mamba_cache_size
+    stub._disable_radix_cache = disable_radix_cache
     stub.model_config = SimpleNamespace(
         is_hybrid_swa=False,
         sliding_window_size=None,
@@ -220,7 +216,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         stub = _hybrid_stub_for_initialize(
             max_running_requests=8, max_mamba_cache_size=2 * RATIO
         )
-        with _arch(hybrid=True):
+        with _arch(hybrid=True), _published(stub):
             stub.initialize()
         self.assertEqual(stub.max_running_requests, 2)
         pool = stub.req_to_token_pool
@@ -233,7 +229,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         stub = _hybrid_stub_for_initialize(
             max_running_requests=4, max_mamba_cache_size=2
         )
-        with _arch(hybrid=True), self.assertRaisesRegex(
+        with _arch(hybrid=True), _published(stub), self.assertRaisesRegex(
             RuntimeError, "max_mamba_cache_size"
         ):
             stub.initialize()
@@ -247,7 +243,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
             max_mamba_cache_size=8,
             disable_radix_cache=True,
         )
-        with _arch(hybrid=True):
+        with _arch(hybrid=True), _published(stub):
             stub.initialize()
         self.assertEqual(stub.max_running_requests, 8)
         pool = stub.req_to_token_pool
@@ -262,7 +258,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
             max_mamba_cache_size=None,
             disable_radix_cache=True,
         )
-        with _arch(hybrid=True):
+        with _arch(hybrid=True), _published(stub):
             stub.initialize()
         self.assertEqual(stub.max_running_requests, 3)
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 3)
@@ -282,7 +278,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
             max_mamba_cache_size=2,
             disable_radix_cache=True,
         )
-        with _arch(hybrid=True):
+        with _arch(hybrid=True), _published(stub):
             stub.initialize()
         pool = stub.req_to_token_pool
         aux_capacity = pool.auxiliary_state_pool.available_size()
@@ -305,7 +301,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
             max_mamba_cache_size=2 * RATIO,
             disable_radix_cache=False,
         )
-        with _arch(hybrid=True):
+        with _arch(hybrid=True), _published(stub):
             stub.initialize()
         pool = stub.req_to_token_pool
         free_before = pool.auxiliary_state_pool.available_size()
@@ -322,7 +318,7 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         stub = _hybrid_stub_for_initialize(
             max_running_requests=2, max_mamba_cache_size=None
         )
-        with _arch(hybrid=True):
+        with _arch(hybrid=True), _published(stub):
             stub.initialize()
         self.assertEqual(stub.max_running_requests, 2)
         self.assertEqual(stub.req_to_token_pool.auxiliary_state_pool.size, 2 * RATIO)
