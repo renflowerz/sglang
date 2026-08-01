@@ -24,6 +24,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     Phase,
     PhaseConfig,
+    default_cuda_graph_config,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
@@ -312,6 +313,105 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.disaggregation_transfer_backend, "mooncake")
+
+
+class TestDeepEPDispatchTokenBudget(unittest.TestCase):
+    def _args(self, **kwargs):
+        return ServerArgs(model_path="dummy", **kwargs)
+
+    def test_skips_non_ep_backends(self):
+        server_args = self._args(moe_a2a_backend="none")
+        server_args.max_running_requests = 64
+        server_args.speculative_num_draft_tokens = 6
+        server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    def test_skips_prefill_workers(self):
+        server_args = self._args(
+            moe_a2a_backend="deepep", disaggregation_mode="prefill"
+        )
+        server_args.max_running_requests = 64
+        server_args.speculative_num_draft_tokens = 6
+        server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    def test_passes_when_default_buffer_covers_wave(self):
+        server_args = self._args(moe_a2a_backend="deepep")
+        server_args.max_running_requests = 21
+        server_args.speculative_num_draft_tokens = 6
+        server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    def test_skips_when_serving_without_speculation(self):
+        # The rug is the verify-window multiplier; the unspeculated wave is
+        # engine-bounded and is not guarded (mirrors the non-spec deepep CI
+        # suites, e.g. test_deepep_(small|large).py at 512/2048 running).
+        server_args = self._args(moe_a2a_backend="deepep")
+        server_args.max_running_requests = 2048
+        server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    def test_graph_bs_does_not_cap_a_speculative_wave(self):
+        # Eager verify may exceed the captured graph bs; the scheduler's max
+        # is the true upper bound even when graph bs is smaller.
+        # NOTE: model_path='dummy' short-circuits post_init before
+        # _handle_cuda_graph_config, so carve the config explicitly.
+        server_args = self._args(moe_a2a_backend="deepep")
+        server_args.max_running_requests = 64
+        server_args.cuda_graph_config = default_cuda_graph_config()
+        server_args.cuda_graph_config.decode.max_bs = 16
+        server_args.speculative_num_draft_tokens = 6
+        with self.assertRaisesRegex(ValueError, "deep_ep.cpp buffer error"):
+            server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    def test_raises_edges_at_buffer_boundary(self):
+        server_args = self._args(moe_a2a_backend="deepep")
+        # 22 x 6 = 132 > 128: the documented rug (default allows ~21).
+        server_args.max_running_requests = 22
+        server_args.speculative_num_draft_tokens = 6
+        with self.assertRaisesRegex(
+            ValueError, "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
+        ):
+            server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    def test_mooncake_uses_its_own_env(self):
+        server_args = self._args(moe_a2a_backend="mooncake")
+        server_args.max_running_requests = 64
+        server_args.speculative_num_draft_tokens = 6
+        with self.assertRaisesRegex(
+            ValueError, "SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
+        ):
+            server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    def test_wave_above_protocol_hard_cap_directs_to_wave_reduction(self):
+        # Required wave beyond the dispatch protocol hard cap (1024) must
+        # advise wave reduction, not an env value the dispatcher would
+        # reject with its own <=1024 assert.
+        server_args = self._args(moe_a2a_backend="deepep")
+        server_args.max_running_requests = 200
+        server_args.speculative_num_draft_tokens = 6  # 1200 > 1024
+        with self.assertRaisesRegex(
+            ValueError, "caps .* at 1024"
+        ):
+            server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    def test_unset_max_running_requests_warns(self):
+        server_args = self._args(moe_a2a_backend="deepep")
+        server_args.speculative_num_draft_tokens = 6
+        with self.assertLogs(level="WARNING") as logs:
+            server_args._validate_deepep_a2a_dispatch_token_budget()
+        self.assertIn("max-running-requests is unset", "\n".join(logs.output))
+
+    def test_env_override_satisfies_wave(self):
+        server_args = self._args(moe_a2a_backend="deepep")
+        server_args.max_running_requests = 64
+        server_args.speculative_num_draft_tokens = 6  # 384 required
+        with self._patch_dispatch_env(
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "384"
+        ):
+            server_args._validate_deepep_a2a_dispatch_token_budget()
+
+    @staticmethod
+    def _patch_dispatch_env(name, value):
+        from unittest.mock import patch
+
+        return patch.dict(os.environ, {name: value})
 
 
 class TestSkipTokenizerInit(unittest.TestCase):
