@@ -3541,6 +3541,10 @@ class ServerArgs:
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
 
+        # Validate the DeepEP/Mooncake EP dispatch buffers cover the steady-state
+        # decode wave (same num_tokens_per_req resolution as above).
+        self._validate_deepep_a2a_dispatch_token_budget()
+
         # Handle model loading format.
         self._handle_load_format()
 
@@ -6558,6 +6562,86 @@ class ServerArgs:
                 f"{required_per_rank}` or lower the relevant limit "
                 f"(e.g. --max-prefill-tokens) to <= {max_cutedsl_tokens}."
             )
+
+    def _validate_deepep_a2a_dispatch_token_budget(self):
+        """Fail fast if the DeepEP/Mooncake EP decode-dispatch buffer cannot
+        cover the steady-state verify wave: max_running_requests x verify
+        tokens per request. Runs after speculative decoding is resolved so
+        speculative_num_draft_tokens (dspark: block size + 1) is final, same
+        contract as _validate_cutedsl_a2a_token_budget()."""
+
+        view = resolved_view(self)
+        backend = view.moe_a2a_backend
+        if backend not in ("deepep", "mooncake"):
+            return
+        if self.disaggregation_mode == "prefill":
+            return
+
+        # The rug is the speculation multiplier: the verify step sends
+        # num_draft_tokens per request through the dispatcher instead of one,
+        # so the steady-state decode wave outgrows the buffer even though the
+        # unspeculated batch fits. Unspeculated batches are a standard,
+        # engine-bounded size and are not guarded here.
+        num_tokens_per_req = self.speculative_num_draft_tokens or 1
+        if num_tokens_per_req <= 1:
+            return
+
+        # With speculation on, the verify wave is the scheduler's running
+        # batch (not the graph batch): eager verify can exceed the captured
+        # graph bs, so the scheduler's max is the true upper bound.
+        if self.max_running_requests is None:
+            logger.warning(
+                "--max-running-requests is unset with "
+                f"--moe-a2a-backend {backend} and a speculative verify window "
+                f"of {num_tokens_per_req}; the dispatch token budget cannot "
+                "be checked. Ensure the exported "
+                f"{'SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK' if backend == 'deepep' else 'SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK'} "
+                "covers scheduler_running x verify window (default 128, hard "
+                "cap 1024), or the dispatcher asserts mid-traffic "
+                "(deep_ep.cpp buffer error)."
+            )
+            return
+        effective_running_requests = self.max_running_requests
+        required_tokens = effective_running_requests * num_tokens_per_req
+
+        env_var = (
+            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
+            if backend == "deepep"
+            else "SGLANG_MOONCAKE_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
+        )
+        max_dispatch_tokens_per_rank = get_int_env_var(env_var, 128)
+        if max_dispatch_tokens_per_rank >= required_tokens:
+            return
+
+        # DeepEP/Mooncake internode dispatch hard-caps the buffer at 1024
+        # tokens per rank (FINISHED_SUM_TAG); suggesting a larger export
+        # would trade this assert for the dispatcher's own <= 1024 check.
+        buffer_hard_cap = 1024
+        if required_tokens <= buffer_hard_cap:
+            mitigation = (
+                f"Set `export {env_var}={required_tokens}`, or reduce the "
+                f"wave: --max-running-requests <= "
+                f"{max_dispatch_tokens_per_rank // num_tokens_per_req}, or "
+                f"a smaller speculative verify window."
+            )
+        else:
+            mitigation = (
+                f"The dispatch protocol caps {env_var} at {buffer_hard_cap}, "
+                f"and the requested wave ({required_tokens}) exceeds even "
+                f"that: reduce --max-running-requests <= "
+                f"{buffer_hard_cap // num_tokens_per_req} or the "
+                f"speculative verify window."
+            )
+
+        raise ValueError(
+            f"--moe-a2a-backend {backend} dispatch buffer "
+            f"({env_var}={max_dispatch_tokens_per_rank}) cannot cover the "
+            f"steady-state decode wave: max_running_requests "
+            f"({effective_running_requests}) x speculative verify tokens per "
+            f"request ({num_tokens_per_req}) = {required_tokens} tokens per "
+            f"rank. The dispatcher asserts at mid-traffic with a deep_ep.cpp "
+            f"buffer error. {mitigation}"
+        )
 
     def _handle_a2a_moe(self):
         # The backend overrides and the ep_size=tp_size adjustments moved to
