@@ -310,16 +310,18 @@ class ModelRunner:
         if server_args.show_time_cost:
             enable_show_time_cost()
 
-        misc_utils.maybe_disable_chunked_prefix_cache(
-            server_args=server_args,
-            use_mla_backend=self.use_mla_backend,
-            is_draft_worker=self.is_draft_worker,
-        )
-
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
         if not self.is_draft_worker:
             set_global_server_args_for_scheduler(server_args)
+
+        # Must run after the target-worker publish above: publishing rebuilds
+        # the config bags from the pristine ServerArgs, which would discard
+        # this gate's bag override.
+        misc_utils.maybe_disable_chunked_prefix_cache(
+            use_mla_backend=self.use_mla_backend,
+            is_draft_worker=self.is_draft_worker,
+        )
 
         # Init OpenMP threads binding for CPU
         if self.device == "cpu":
