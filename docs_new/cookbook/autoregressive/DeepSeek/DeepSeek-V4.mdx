@@ -591,3 +591,27 @@ Larger blocks can improve decode latency when acceptance stays high, but they al
 For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
 
 DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; turn DSpark off before selecting a prefill or decode role. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
+
+### 3.5 Verified profile: two TP4 replicas on one 8×B200 (0731, DSpark, MXFP4)
+
+On a single 8×B200 (180 GB) node, running **two independent TP4 replicas** behind `sglang-router` lets two prefills progress concurrently (one per replica's four GPUs) versus one TP8 server — a strong shape for coding-scale long-context latency. This profile is verified end-to-end first-day (2026-07-31) on v0.5.16 with the uniquely-seeded prompt corpus note below.
+
+Key differences from the single-server recipe above:
+
+| Knob | Value | Why |
+|------|-------|-----|
+| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `384` | with the checkpoint-default verify window (6 tokens/req), the default `128` fits only ~21 concurrent verify waves; the dispatcher asserts mid-traffic above it |
+| `--mem-fraction-static` | `0.93` | 0.90 starves KV at TP4: 0.90–0.92 fail the KV-allocation path at boot, 0.925 is the computed minimum, 0.93 holds through graph capture |
+| `--speculative-dspark-block-size` + `--cuda-graph-max-bs-decode` | `4` + `16` | the checkpoint default (5/32) OOMs during verify-graph capture at TP4; 4/16 fits |
+| `--tool-call-parser` | `deepseekv4` | surfaces native `<｜DSML｜>` tool markup as `tool_calls` (streaming deltas + parallel calls verified) |
+
+Measured with `python -m sglang.bench_serving` against the router, `num_prompts=64`, 50,000-token unique-seeded inputs, `--max_new_tokens 1024` (no ignore-EOS; completion length is decode-regulated), concurrency 16:
+
+| Phase | Sustained | Latency |
+|-------|-----------|---------|
+| Prefill | 12,582 tok/s aggregate (≈1.6k tok/s per GPU) | TTFT median 3.83 s |
+| Decode | 308 tok/s sustained (1,847 peak across bursts) | TPOT median 37.8 ms, ITL median 5.35 ms |
+
+DSpark on the same 50k-token corpus class (8-stream probe against one replica): accept length **4.72**, accept rate **0.93** (`sglang_spec_accept_*` on the `/metrics` endpoint). 64/64 requests land with zero restarts across the capture-and-serve window.
+
+Prefer unique-seeded prompts for this class of benchmark: repetitive corpora inflate aggregated radix-cache numbers roughly 4× relative to real coding-agent traffic.
